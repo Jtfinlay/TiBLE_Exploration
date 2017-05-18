@@ -62,6 +62,7 @@
 
 #include "util.h"
 
+#include "ble.h"
 #include "Board.h"
 #include "project_zero.h"
 
@@ -74,15 +75,7 @@
 /*********************************************************************
  * CONSTANTS
  */
-// Advertising interval when device is discoverable (units of 625us, 160=100ms)
-#define DEFAULT_ADVERTISING_INTERVAL          160
 
-// Limited discoverable mode advertises for 30.72s, and then stops
-// General discoverable mode advertises indefinitely
-#define DEFAULT_DISCOVERABLE_MODE             GAP_ADTYPE_FLAGS_GENERAL
-
-// Default pass-code used for pairing.
-#define DEFAULT_PASSCODE                      000000
 
 // Task configuration
 #define PRZ_TASK_PRIORITY                     1
@@ -91,26 +84,11 @@
 #define PRZ_TASK_STACK_SIZE                   800
 #endif
 
-// Internal Events for RTOS application
-#define PRZ_STATE_CHANGE_EVT                  0x0001
-#define PRZ_CHAR_CHANGE_EVT                   0x0002
-#define PRZ_PERIODIC_EVT                      0x0004
-#define PRZ_CONN_EVT_END_EVT                  0x0008
 
 /*********************************************************************
  * TYPEDEFS
  */
-// Types of messages that can be sent to the user application task from other
-// tasks or interrupts. Note: Messages from BLE Stack are sent differently.
-typedef enum
-{
-  APP_MSG_SERVICE_WRITE = 0,   /* A characteristic value has been written     */
-  APP_MSG_SERVICE_CFG,         /* A characteristic configuration has changed  */
-  APP_MSG_UPDATE_CHARVAL,      /* Request from ourselves to update a value    */
-  APP_MSG_GAP_STATE_CHANGE,    /* The GAP / connection state has changed      */
-  APP_MSG_BUTTON_DEBOUNCED,    /* A button has been debounced with new value  */
-  APP_MSG_SEND_PASSCODE,       /* A pass-code/PIN is requested during pairing */
-} app_msg_types_t;
+
 
 // Struct for messages sent to the application task
 typedef struct
@@ -128,15 +106,6 @@ typedef struct
   uint8_t  paramID; // Index of the characteristic
   uint8_t  data[];  // Flexible array member, extended to malloc - sizeof(.)
 } char_data_t;
-
-// Struct for message about sending/requesting passcode from peer.
-typedef struct
-{
-  uint16_t connHandle;
-  uint8_t  uiInputs;
-  uint8_t  uiOutputs;
-  uint32   numComparison;
-} passcode_req_t;
 
 // Struct for message about button state
 typedef struct
@@ -162,41 +131,6 @@ static Queue_Handle hApplicationMsgQ;
 // Task configuration
 Task_Struct przTask;
 Char przTaskStack[PRZ_TASK_STACK_SIZE];
-
-
-// GAP - SCAN RSP data (max size = 31 bytes)
-static uint8_t scanRspData[] =
-{
-  // No scan response data provided.
-  0x00 // Placeholder to keep the compiler happy.
-};
-
-// GAP - Advertisement data (max size = 31 bytes, though this is
-// best kept short to conserve power while advertisting)
-static uint8_t advertData[] =
-{
-  // Flags; this sets the device to use limited discoverable
-  // mode (advertises for 30 seconds at a time) or general
-  // discoverable mode (advertises indefinitely), depending
-  // on the DEFAULT_DISCOVERY_MODE define.
-  0x02,   // length of this data
-  GAP_ADTYPE_FLAGS,
-  DEFAULT_DISCOVERABLE_MODE | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED,
-
-  // complete name
-  13,
-  GAP_ADTYPE_LOCAL_NAME_COMPLETE,
-  'P', 'r', 'o', 'j', 'e', 'c', 't', ' ', 'Z', 'e', 'r', 'o',
-
-};
-
-// GAP GATT Attributes
-static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "Project Zero";
-
-// Globals used for ATT Response retransmission
-static gattMsgEvent_t *pAttRsp = NULL;
-static uint8_t rspTxRetry = 0;
-
 
 /* Pin driver handles */
 static PIN_Handle buttonPinHandle;
@@ -245,19 +179,7 @@ static void ProjectZero_init( void );
 static void ProjectZero_taskFxn(UArg a0, UArg a1);
 
 static void user_processApplicationMessage(app_msg_t *pMsg);
-static uint8_t ProjectZero_processStackMsg(ICall_Hdr *pMsg);
 static uint8_t ProjectZero_processGATTMsg(gattMsgEvent_t *pMsg);
-
-static void ProjectZero_sendAttRsp(void);
-static uint8_t ProjectZero_processGATTMsg(gattMsgEvent_t *pMsg);
-static void ProjectZero_freeAttRsp(uint8_t status);
-
-static void user_processGapStateChangeEvt(gaprole_States_t newState);
-static void user_gapStateChangeCB(gaprole_States_t newState);
-static void user_gapBondMgr_passcodeCB(uint8_t *deviceAddr, uint16_t connHandle,
-                                       uint8_t uiInputs, uint8_t uiOutputs, uint32 numComparison);
-static void user_gapBondMgr_pairStateCB(uint16_t connHandle, uint8_t state,
-                                        uint8_t status);
 
 static void buttonDebounceSwiFxn(UArg buttonId);
 static void user_handleButtonPress(button_state_t *pState);
@@ -290,18 +212,6 @@ static char *Util_getLocalNameStr(const uint8_t *data);
  * PROFILE CALLBACKS
  */
 
-// GAP Role Callbacks
-static gapRolesCBs_t user_gapRoleCBs =
-{
-  user_gapStateChangeCB     // Profile State Change Callbacks
-};
-
-// GAP Bond Manager Callbacks
-static gapBondCBs_t user_bondMgrCBs =
-{
-  user_gapBondMgr_passcodeCB, // Passcode callback
-  user_gapBondMgr_pairStateCB // Pairing / Bonding state Callback
-};
 
 /*
  * Callbacks in the user application for events originating from BLE services.
@@ -426,72 +336,8 @@ static void ProjectZero_init(void)
                   50 * (1000/Clock_tickPeriod),
                   &clockParams);
 
-  // ******************************************************************
-  // BLE Stack initialization
-  // ******************************************************************
-
-  // Setup the GAP Peripheral Role Profile
-  uint8_t initialAdvertEnable = TRUE;  // Advertise on power-up
-
-  // By setting this to zero, the device will go into the waiting state after
-  // being discoverable. Otherwise wait this long [ms] before advertising again.
-  uint16_t advertOffTime = 0; // miliseconds
-
-  // Set advertisement enabled.
-  GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
-                       &initialAdvertEnable);
-
-  // Configure the wait-time before restarting advertisement automatically
-  GAPRole_SetParameter(GAPROLE_ADVERT_OFF_TIME, sizeof(uint16_t),
-                       &advertOffTime);
-
-  // Initialize Scan Response data
-  GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
-
-  // Initialize Advertisement data
-  GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
-
-  Log_info1("Name in advertData array: \x1b[33m%s\x1b[0m",
-            (IArg)Util_getLocalNameStr(advertData));
-
-  // Set advertising interval
-  uint16_t advInt = DEFAULT_ADVERTISING_INTERVAL;
-
-  GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MIN, advInt);
-  GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MAX, advInt);
-  GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MIN, advInt);
-  GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MAX, advInt);
-
-  // Set duration of advertisement before stopping in Limited adv mode.
-  GAP_SetParamValue(TGAP_LIM_ADV_TIMEOUT, 30); // Seconds
-
-  // ******************************************************************
-  // BLE Bond Manager initialization
-  // ******************************************************************
-  uint32_t passkey = 0; // passkey "000000"
-  uint8_t pairMode = GAPBOND_PAIRING_MODE_WAIT_FOR_REQ;
-  uint8_t mitm = TRUE;
-  uint8_t ioCap = GAPBOND_IO_CAP_DISPLAY_ONLY;
-  uint8_t bonding = TRUE;
-
-  GAPBondMgr_SetParameter(GAPBOND_DEFAULT_PASSCODE, sizeof(uint32_t),
-                          &passkey);
-  GAPBondMgr_SetParameter(GAPBOND_PAIRING_MODE, sizeof(uint8_t), &pairMode);
-  GAPBondMgr_SetParameter(GAPBOND_MITM_PROTECTION, sizeof(uint8_t), &mitm);
-  GAPBondMgr_SetParameter(GAPBOND_IO_CAPABILITIES, sizeof(uint8_t), &ioCap);
-  GAPBondMgr_SetParameter(GAPBOND_BONDING_ENABLED, sizeof(uint8_t), &bonding);
-
-  // ******************************************************************
-  // BLE Service initialization
-  // ******************************************************************
-
-  // Add services to GATT server
-  GGS_AddService(GATT_ALL_SERVICES);           // GAP
-  GATTServApp_AddService(GATT_ALL_SERVICES);   // GATT attributes
-  DevInfo_AddService();                        // Device Information Service
-
-  // Set the device name characteristic in the GAP Profile
-  GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, attDeviceName);
+  // Initialize BLE
+  bleInit(selfEntity, hApplicationMsgQ, &sem);
 
   // Add services to GATT server and give ID of this task for Indication acks.
   LedService_AddService( selfEntity );
@@ -519,18 +365,6 @@ static void ProjectZero_init(void)
   // Initalization of characteristics in Data_Service that can provide data.
   DataService_SetParameter(DS_STRING_ID, sizeof(initString), initString);
   DataService_SetParameter(DS_STREAM_ID, DS_STREAM_LEN, initVal);
-
-  // Start the stack in Peripheral mode.
-  VOID GAPRole_StartDevice(&user_gapRoleCBs);
-
-  // Start Bond Manager
-  VOID GAPBondMgr_Register(&user_bondMgrCBs);
-
-  // Register with GAP for HCI/Host messages
-  GAP_RegisterForMsgs(selfEntity);
-
-  // Register for GATT local events and ATT Responses pending for transmission
-  GATT_RegisterForMsgs(selfEntity);
 }
 
 
@@ -567,42 +401,7 @@ static void ProjectZero_taskFxn(UArg a0, UArg a1)
 
     if (errno == ICALL_ERRNO_SUCCESS)
     {
-      ICall_EntityID dest;
-      ICall_ServiceEnum src;
-      ICall_HciExtEvt *pMsg = NULL;
-
-      // Check if we got a signal because of a stack message
-      if (ICall_fetchServiceMsg(&src, &dest,
-                                (void **)&pMsg) == ICALL_ERRNO_SUCCESS)
-      {
-        uint8 safeToDealloc = TRUE;
-
-        if ((src == ICALL_SERVICE_CLASS_BLE) && (dest == selfEntity))
-        {
-          ICall_Stack_Event *pEvt = (ICall_Stack_Event *)pMsg;
-
-          // Check for event flags received (event signature 0xffff)
-          if (pEvt->signature == 0xffff)
-          {
-            // Event received when a connection event is completed
-            if (pEvt->event_flag & PRZ_CONN_EVT_END_EVT)
-            {
-              // Try to retransmit pending ATT Response (if any)
-              ProjectZero_sendAttRsp();
-            }
-          }
-          else // It's a message from the stack and not an event.
-          {
-            // Process inter-task message
-            safeToDealloc = ProjectZero_processStackMsg((ICall_Hdr *)pMsg);
-          }
-        }
-
-        if (pMsg && safeToDealloc)
-        {
-          ICall_freeMsg(pMsg);
-        }
-      }
+    	ProjectZero_processStackMsg();
 
       // Process messages sent from another task or another context.
       while (!Queue_empty(hApplicationMsgQ))
@@ -707,81 +506,6 @@ static void user_processApplicationMessage(app_msg_t *pMsg)
  *****************************************************************************/
 
 
-/*
- * @brief   Process a pending GAP Role state change event.
- *
- * @param   newState - new state
- *
- * @return  None.
- */
-static void user_processGapStateChangeEvt(gaprole_States_t newState)
-{
-  switch ( newState )
-  {
-    case GAPROLE_STARTED:
-      {
-        uint8_t ownAddress[B_ADDR_LEN];
-        uint8_t systemId[DEVINFO_SYSTEM_ID_LEN];
-
-        GAPRole_GetParameter(GAPROLE_BD_ADDR, ownAddress);
-
-        // use 6 bytes of device address for 8 bytes of system ID value
-        systemId[0] = ownAddress[0];
-        systemId[1] = ownAddress[1];
-        systemId[2] = ownAddress[2];
-
-        // set middle bytes to zero
-        systemId[4] = 0x00;
-        systemId[3] = 0x00;
-
-        // shift three bytes up
-        systemId[7] = ownAddress[5];
-        systemId[6] = ownAddress[4];
-        systemId[5] = ownAddress[3];
-
-        DevInfo_SetParameter(DEVINFO_SYSTEM_ID, DEVINFO_SYSTEM_ID_LEN, systemId);
-
-        // Display device address
-        char *cstr_ownAddress = Util_convertBdAddr2Str(ownAddress);
-        Log_info1("GAP is started. Our address: \x1b[32m%s\x1b[0m", (IArg)cstr_ownAddress);
-      }
-      break;
-
-    case GAPROLE_ADVERTISING:
-      Log_info0("Advertising");
-      break;
-
-    case GAPROLE_CONNECTED:
-      {
-        uint8_t peerAddress[B_ADDR_LEN];
-
-        GAPRole_GetParameter(GAPROLE_CONN_BD_ADDR, peerAddress);
-
-        char *cstr_peerAddress = Util_convertBdAddr2Str(peerAddress);
-        Log_info1("Connected. Peer address: \x1b[32m%s\x1b[0m", (IArg)cstr_peerAddress);
-       }
-      break;
-
-    case GAPROLE_CONNECTED_ADV:
-      Log_info0("Connected and advertising");
-      break;
-
-    case GAPROLE_WAITING:
-      Log_info0("Disconnected / Idle");
-      break;
-
-    case GAPROLE_WAITING_AFTER_TIMEOUT:
-      Log_info0("Connection timed out");
-      break;
-
-    case GAPROLE_ERROR:
-      Log_info0("Error");
-      break;
-
-    default:
-      break;
-  }
-}
 
 
 /*
@@ -1024,195 +748,6 @@ void user_DataService_CfgChangeHandler(char_data_t *pCharData)
   }
 }
 
-
-/*
- * @brief   Process an incoming BLE stack message.
- *
- *          This could be a GATT message from a peer device like acknowledgement
- *          of an Indication we sent, or it could be a response from the stack
- *          to an HCI message that the user application sent.
- *
- * @param   pMsg - message to process
- *
- * @return  TRUE if safe to deallocate incoming message, FALSE otherwise.
- */
-static uint8_t ProjectZero_processStackMsg(ICall_Hdr *pMsg)
-{
-  uint8_t safeToDealloc = TRUE;
-
-  switch (pMsg->event)
-  {
-    case GATT_MSG_EVENT:
-      // Process GATT message
-      safeToDealloc = ProjectZero_processGATTMsg((gattMsgEvent_t *)pMsg);
-      break;
-
-    case HCI_GAP_EVENT_EVENT:
-      {
-        // Process HCI message
-        switch(pMsg->status)
-        {
-          case HCI_COMMAND_COMPLETE_EVENT_CODE:
-            // Process HCI Command Complete Event
-            Log_info0("HCI Command Complete Event received");
-            break;
-
-          default:
-            break;
-        }
-      }
-      break;
-
-    default:
-      // do nothing
-      break;
-  }
-
-  return (safeToDealloc);
-}
-
-
-/*
- * @brief   Process GATT messages and events.
- *
- * @return  TRUE if safe to deallocate incoming message, FALSE otherwise.
- */
-static uint8_t ProjectZero_processGATTMsg(gattMsgEvent_t *pMsg)
-{
-  // See if GATT server was unable to transmit an ATT response
-  if (pMsg->hdr.status == blePending)
-  {
-    Log_warning1("Outgoing RF FIFO full. Re-schedule transmission of msg with opcode 0x%02x",
-      pMsg->method);
-
-    // No HCI buffer was available. Let's try to retransmit the response
-    // on the next connection event.
-    if (HCI_EXT_ConnEventNoticeCmd(pMsg->connHandle, selfEntity,
-                                   PRZ_CONN_EVT_END_EVT) == SUCCESS)
-    {
-      // First free any pending response
-      ProjectZero_freeAttRsp(FAILURE);
-
-      // Hold on to the response message for retransmission
-      pAttRsp = pMsg;
-
-      // Don't free the response message yet
-      return (FALSE);
-    }
-  }
-  else if (pMsg->method == ATT_FLOW_CTRL_VIOLATED_EVENT)
-  {
-    // ATT request-response or indication-confirmation flow control is
-    // violated. All subsequent ATT requests or indications will be dropped.
-    // The app is informed in case it wants to drop the connection.
-
-    // Log the opcode of the message that caused the violation.
-    Log_error1("Flow control violated. Opcode of offending ATT msg: 0x%02x",
-      pMsg->msg.flowCtrlEvt.opcode);
-  }
-  else if (pMsg->method == ATT_MTU_UPDATED_EVENT)
-  {
-    // MTU size updated
-    Log_info1("MTU Size change: %d bytes", pMsg->msg.mtuEvt.MTU);
-  }
-  else
-  {
-    // Got an expected GATT message from a peer.
-    Log_info1("Recevied GATT Message. Opcode: 0x%02x", pMsg->method);
-  }
-
-  // Free message payload. Needed only for ATT Protocol messages
-  GATT_bm_free(&pMsg->msg, pMsg->method);
-
-  // It's safe to free the incoming message
-  return (TRUE);
-}
-
-
-
-
-/*
- *  Application error handling functions
- *****************************************************************************/
-
-/*
- * @brief   Send a pending ATT response message.
- *
- *          The message is one that the stack was trying to send based on a
- *          peer request, but the response couldn't be sent because the
- *          user application had filled the TX queue with other data.
- *
- * @param   none
- *
- * @return  none
- */
-static void ProjectZero_sendAttRsp(void)
-{
-  // See if there's a pending ATT Response to be transmitted
-  if (pAttRsp != NULL)
-  {
-    uint8_t status;
-
-    // Increment retransmission count
-    rspTxRetry++;
-
-    // Try to retransmit ATT response till either we're successful or
-    // the ATT Client times out (after 30s) and drops the connection.
-    status = GATT_SendRsp(pAttRsp->connHandle, pAttRsp->method, &(pAttRsp->msg));
-    if ((status != blePending) && (status != MSG_BUFFER_NOT_AVAIL))
-    {
-      // Disable connection event end notice
-      HCI_EXT_ConnEventNoticeCmd(pAttRsp->connHandle, selfEntity, 0);
-
-      // We're done with the response message
-      ProjectZero_freeAttRsp(status);
-    }
-    else
-    {
-      // Continue retrying
-      Log_warning2("Retrying message with opcode 0x%02x. Attempt %d",
-        pAttRsp->method, rspTxRetry);
-    }
-  }
-}
-
-/*
- * @brief   Free ATT response message.
- *
- * @param   status - response transmit status
- *
- * @return  none
- */
-static void ProjectZero_freeAttRsp(uint8_t status)
-{
-  // See if there's a pending ATT response message
-  if (pAttRsp != NULL)
-  {
-    // See if the response was sent out successfully
-    if (status == SUCCESS)
-    {
-      Log_info2("Sent message with opcode 0x%02x. Attempt %d",
-        pAttRsp->method, rspTxRetry);
-    }
-    else
-    {
-      Log_error2("Gave up message with opcode 0x%02x. Status: %d",
-        pAttRsp->method, status);
-
-      // Free response payload
-      GATT_bm_free(&pAttRsp->msg, pAttRsp->method);
-    }
-
-    // Free response message
-    ICall_freeMsg(pAttRsp);
-
-    // Reset our globals
-    pAttRsp = NULL;
-    rspTxRetry = 0;
-  }
-}
-
-
 /******************************************************************************
  *****************************************************************************
  *
@@ -1229,76 +764,7 @@ static void ProjectZero_freeAttRsp(uint8_t status)
  *  Callbacks from the Stack Task context (GAP or Service changes)
  *****************************************************************************/
 
-/**
- * Callback from GAP Role indicating a role state change.
- */
-static void user_gapStateChangeCB(gaprole_States_t newState)
-{
-  Log_info1("(CB) GAP State change: %d, Sending msg to app.", (IArg)newState);
-  user_enqueueRawAppMsg( APP_MSG_GAP_STATE_CHANGE, (uint8_t *)&newState, sizeof(newState) );
-}
 
-/*
- * @brief   Passcode callback.
- *
- * @param   connHandle - connection handle
- * @param   uiInputs   - input passcode?
- * @param   uiOutputs  - display passcode?
- * @param   numComparison - numeric comparison value
- *
- * @return  none
- */
-static void user_gapBondMgr_passcodeCB(uint8_t *deviceAddr, uint16_t connHandle,
-                                       uint8_t uiInputs, uint8_t uiOutputs, uint32 numComparison)
-{
-  passcode_req_t req =
-  {
-    .connHandle = connHandle,
-    .uiInputs = uiInputs,
-    .uiOutputs = uiOutputs,
-    .numComparison = numComparison
-  };
-
-  // Defer handling of the passcode request to the application, in case
-  // user input is required, and because a BLE API must be used from Task.
-  user_enqueueRawAppMsg(APP_MSG_SEND_PASSCODE, (uint8_t *)&req, sizeof(req));
-}
-
-/*
- * @brief   Pairing state callback.
- *
- * @param   connHandle - connection handle
- * @param   state      - pairing state
- * @param   status     - pairing status
- *
- * @return  none
- */
-static void user_gapBondMgr_pairStateCB(uint16_t connHandle, uint8_t state,
-                                        uint8_t status)
-{
-  if (state == GAPBOND_PAIRING_STATE_STARTED)
-  {
-    Log_info0("Pairing started");
-  }
-  else if (state == GAPBOND_PAIRING_STATE_COMPLETE)
-  {
-    if (status == SUCCESS)
-    {
-      Log_info0("Pairing completed successfully.");
-    }
-    else
-    {
-      Log_error1("Pairing failed. Error: %02x", status);
-    }
-  }
-  else if (state == GAPBOND_PAIRING_STATE_BONDED)
-  {
-    if (status == SUCCESS)
-    {
-     Log_info0("Re-established pairing from stored bond info.");
-    }
-  }
-}
 
 /**
  * Callback handler for characteristic value changes in services.
